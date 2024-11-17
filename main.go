@@ -4,15 +4,21 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"image/jpeg"
 	"math/rand/v2"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/chai2010/webp"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -45,7 +51,7 @@ func formatSenderJID(jid types.JID) types.JID {
 	return types.NewJID(formattedUser, jid.Server)
 }
 
-func ConvertJPEGToWebP(input []byte, quality int) ([]byte, error) {
+/* func ConvertJPEGToWebP(input []byte, quality int) ([]byte, error) {
 	inputFile, err := os.CreateTemp("", "input-*.jpg")
 	if err != nil {
 		return nil, err
@@ -75,6 +81,88 @@ func ConvertJPEGToWebP(input []byte, quality int) ([]byte, error) {
 	}
 
 	return outputBuffer.Bytes(), nil
+} */
+
+func ConvertJPEGToWebP(input []byte, quality float32) ([]byte, error) {
+	// Decodificar a imagem JPEG do slice de bytes
+	img, err := jpeg.Decode(bytes.NewReader(input))
+	if err != nil {
+		return nil, fmt.Errorf("erro ao decodificar JPEG: %v", err)
+	}
+
+	// Criar um buffer para armazenar a saída em WebP
+	var outputBuffer bytes.Buffer
+
+	// Codificar a imagem em formato WebP
+	if err := webp.Encode(&outputBuffer, img, &webp.Options{Quality: quality}); err != nil {
+		return nil, fmt.Errorf("erro ao codificar WebP: %v", err)
+	}
+
+	return outputBuffer.Bytes(), nil
+}
+
+func AddExifToWebP(inputData []byte, packID, packName, authorName string) ([]byte, error) {
+	// Constantes para os bytes iniciais e finais necessários
+	startingBytes := []byte{0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x41, 0x57, 0x07, 0x00}
+	endingBytes := []byte{0x16, 0x00, 0x00, 0x00}
+	var b bytes.Buffer
+
+	// JSON de metadados
+	jsonData := map[string]interface{}{
+		"sticker-pack-id":        packID,
+		"sticker-pack-name":      packName,
+		"sticker-pack-publisher": authorName,
+		"emojis":                 []string{"😀"},
+	}
+
+	jsonBytes, err := json.Marshal(jsonData)
+	if err != nil {
+		return nil, err
+	}
+
+	// Escrevendo os bytes iniciais e o comprimento dos metadados
+	jsonLength := uint32(len(jsonBytes))
+	lenBuffer := make([]byte, 4)
+	binary.LittleEndian.PutUint32(lenBuffer, jsonLength)
+
+	if _, err := b.Write(startingBytes); err != nil {
+		return nil, err
+	}
+	if _, err := b.Write(lenBuffer); err != nil {
+		return nil, err
+	}
+	if _, err := b.Write(endingBytes); err != nil {
+		return nil, err
+	}
+	if _, err := b.Write(jsonBytes); err != nil {
+		return nil, err
+	}
+
+	// Caminhos temporários para os arquivos
+	tempDir := os.TempDir()
+	inputPath := filepath.Join(tempDir, "input.webp")
+	outputPath := filepath.Join(tempDir, "output.webp")
+	exifPath := filepath.Join(tempDir, "exif.exif")
+
+	// Salvando os arquivos temporários
+	if err := os.WriteFile(inputPath, inputData, 0644); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(exifPath, b.Bytes(), 0644); err != nil {
+		return nil, err
+	}
+	defer os.Remove(inputPath)
+	defer os.Remove(exifPath)
+	defer os.Remove(outputPath)
+
+	// Comando webpmux para inserir EXIF
+	cmd := exec.Command("webpmux", "-set", "exif", exifPath, inputPath, "-o", outputPath)
+	if err := cmd.Run(); err != nil {
+		return nil, errors.New("falha ao executar o comando webpmux: " + err.Error())
+	}
+
+	// Retornando a imagem WebP final com EXIF
+	return os.ReadFile(outputPath)
 }
 
 func eventHandler(client *whatsmeow.Client) func(evt interface{}) {
@@ -151,7 +239,13 @@ func eventHandler(client *whatsmeow.Client) func(evt interface{}) {
 								return
 							}
 
-							resp, err := client.Upload(context.Background(), webPImg, whatsmeow.MediaImage)
+							webPWithExif, err := AddExifToWebP(webPImg, "com.snowcorp.stickerly.android.stickercontentprovider 2f44112f-1143-49e7-8ff7-ba18595760a3", "kakaka", "Sticker.ly * glauber_viniciusff")
+							if err != nil {
+								fmt.Println("Erro ao adicionar EXIF:", err)
+								return
+							}
+
+							resp, err := client.Upload(context.Background(), webPWithExif, whatsmeow.MediaImage)
 							if err != nil {
 								fmt.Println(err)
 								return
